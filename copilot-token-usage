@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""
+copilot-token-usage: Parse Copilot CLI logs and produce a JSON summary of token usage.
+
+Usage:
+  copilot-token-usage [--days N] [--output PATH] [--pretty] [--session SESSION_ID]
+
+Output is written to ~/.copilot/token-usage.json by default.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+LOGS_DIR = Path.home() / ".copilot" / "logs"
+DEFAULT_OUTPUT = Path.home() / ".copilot" / "token-usage.json"
+
+# Regex to match the telemetry log line and capture the JSON block that follows
+TELEMETRY_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z) \[INFO\] \[Telemetry\] cli\.model_call:"
+)
+
+
+def parse_json_block(lines, start_idx):
+    """Extract a JSON object starting at lines[start_idx] (should be '{')."""
+    depth = 0
+    buf = []
+    for i in range(start_idx, len(lines)):
+        line = lines[i]
+        buf.append(line)
+        depth += line.count("{") - line.count("}")
+        if depth <= 0:
+            break
+    try:
+        return json.loads("\n".join(buf))
+    except json.JSONDecodeError:
+        return None
+
+
+def parse_log_file(filepath):
+    """Yield (timestamp_str, telemetry_dict) for each model_call in the log file."""
+    with open(filepath, "r", errors="replace") as f:
+        lines = f.readlines()
+
+    i = 0
+    while i < len(lines):
+        m = TELEMETRY_RE.match(lines[i])
+        if m:
+            ts = m.group(1)
+            # Next line should be the opening brace
+            if i + 1 < len(lines) and lines[i + 1].strip().startswith("{"):
+                obj = parse_json_block(lines, i + 1)
+                if obj:
+                    yield ts, obj
+        i += 1
+
+
+def estimate_premium_requests(model, input_tokens, output_tokens, cached_tokens):
+    """
+    Rough estimate of premium request equivalents.
+    Based on GitHub Copilot's billing model where 1 premium request ≈ 80k tokens
+    for standard models, with multipliers for premium models.
+
+    Model tiers (approximate):
+    - claude-opus-4.6-1m, claude-opus-4.5: 1 req per ~80k total tokens
+    - claude-sonnet-4.5, claude-sonnet-4: standard rate
+    - gpt-5, gpt-5.1, gpt-5.2: standard rate
+    - claude-haiku-4.5, gpt-5-mini, gpt-4.1: ~1/3 rate
+    """
+    total = input_tokens + output_tokens
+    model_lower = model.lower()
+
+    if "opus" in model_lower:
+        # Premium models cost more per request
+        return max(1, total / 80_000)
+    elif "haiku" in model_lower or "mini" in model_lower or "gpt-4.1" in model_lower:
+        # Cheaper models
+        return max(0, total / 240_000)
+    else:
+        # Standard models
+        return max(0, total / 80_000)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Summarize Copilot CLI token usage from logs")
+    parser.add_argument(
+        "--days", type=int, default=None,
+        help="Only process log files modified within the last N days (default: all)"
+    )
+    parser.add_argument(
+        "--output", "-o", type=str, default=str(DEFAULT_OUTPUT),
+        help=f"Output JSON file path (default: {DEFAULT_OUTPUT})"
+    )
+    parser.add_argument(
+        "--pretty", action="store_true",
+        help="Pretty-print JSON output"
+    )
+    parser.add_argument(
+        "--session", type=str, default=None,
+        help="Filter to a specific session ID"
+    )
+    parser.add_argument(
+        "--summary", action="store_true",
+        help="Print a human-readable summary to stderr"
+    )
+    args = parser.parse_args()
+
+    if not LOGS_DIR.exists():
+        print(f"Error: Copilot logs directory not found at {LOGS_DIR}", file=sys.stderr)
+        sys.exit(1)
+
+    # Find log files, optionally filtered by age
+    log_files = sorted(LOGS_DIR.glob("process-*.log"))
+    if args.days is not None:
+        cutoff = datetime.now().timestamp() - (args.days * 86400)
+        log_files = [f for f in log_files if f.stat().st_mtime >= cutoff]
+
+    if not log_files:
+        print("No log files found.", file=sys.stderr)
+        sys.exit(0)
+
+    # session_id -> { model -> {calls, input, output, cached, duration, first_ts, last_ts} }
+    sessions = defaultdict(lambda: {
+        "models": defaultdict(lambda: {
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+            "total_duration_ms": 0,
+        }),
+        "log_files": set(),
+        "first_call_at": None,
+        "last_call_at": None,
+    })
+
+    total_calls_parsed = 0
+
+    for log_file in log_files:
+        for ts, obj in parse_log_file(log_file):
+            session_id = obj.get("session_id")
+            model = obj.get("model", "unknown")
+            if not session_id:
+                continue
+            if args.session and session_id != args.session:
+                continue
+
+            total_calls_parsed += 1
+            sess = sessions[session_id]
+            sess["log_files"].add(log_file.name)
+
+            if sess["first_call_at"] is None or ts < sess["first_call_at"]:
+                sess["first_call_at"] = ts
+            if sess["last_call_at"] is None or ts > sess["last_call_at"]:
+                sess["last_call_at"] = ts
+
+            m = sess["models"][model]
+            m["calls"] += 1
+            m["input_tokens"] += obj.get("prompt_tokens_count", 0)
+            m["output_tokens"] += obj.get("completion_tokens_count", 0)
+            m["cached_tokens"] += obj.get("cached_tokens_count", 0)
+            m["total_duration_ms"] += obj.get("duration_ms", 0)
+
+    # Build output
+    session_list = []
+    grand_by_model = defaultdict(lambda: {
+        "calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "total_duration_ms": 0,
+        "estimated_premium_requests": 0.0,
+    })
+    grand_totals = {
+        "total_sessions": 0,
+        "total_calls": 0,
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_cached_tokens": 0,
+        "total_duration_ms": 0,
+        "estimated_premium_requests": 0.0,
+    }
+
+    for session_id, sess in sorted(sessions.items(), key=lambda x: x[1]["first_call_at"] or ""):
+        session_models = {}
+        sess_totals = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "total_duration_ms": 0, "estimated_premium_requests": 0.0}
+
+        for model, stats in sorted(sess["models"].items()):
+            est = estimate_premium_requests(model, stats["input_tokens"], stats["output_tokens"], stats["cached_tokens"])
+            session_models[model] = _add_formatted({
+                **stats,
+                "estimated_premium_requests": round(est, 1),
+            })
+            for k in ["calls", "input_tokens", "output_tokens", "cached_tokens", "total_duration_ms"]:
+                sess_totals[k] += stats[k]
+                grand_by_model[model][k] += stats[k]
+            sess_totals["estimated_premium_requests"] += est
+            grand_by_model[model]["estimated_premium_requests"] += est
+
+        session_list.append({
+            "session_id": session_id,
+            "log_files": sorted(sess["log_files"]),
+            "first_call_at": sess["first_call_at"],
+            "last_call_at": sess["last_call_at"],
+            "models": session_models,
+            "totals": _add_formatted({k: (round(v, 1) if isinstance(v, float) else v) for k, v in sess_totals.items()}),
+        })
+
+        grand_totals["total_sessions"] += 1
+        for k in ["calls", "input_tokens", "output_tokens", "cached_tokens"]:
+            grand_totals[f"total_{k}"] += sess_totals[k]
+        grand_totals["total_duration_ms"] += sess_totals["total_duration_ms"]
+        grand_totals["estimated_premium_requests"] += sess_totals["estimated_premium_requests"]
+
+    # Clean up grand_by_model floats
+    grand_by_model_clean = {}
+    for model, stats in sorted(grand_by_model.items()):
+        grand_by_model_clean[model] = _add_formatted({k: (round(v, 1) if isinstance(v, float) else v) for k, v in stats.items()})
+
+    grand_totals["estimated_premium_requests"] = round(grand_totals["estimated_premium_requests"], 1)
+    grand_totals["total_calls"] = total_calls_parsed
+
+    output = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "log_files_scanned": len(log_files),
+        "sessions": session_list,
+        "grand_totals": _add_formatted({
+            **grand_totals,
+            "by_model": grand_by_model_clean,
+        }),
+    }
+
+    # Write JSON
+    output_path = Path(args.output)
+    json_str = json.dumps(output, indent=2, default=str)
+
+    with open(output_path, "w") as f:
+        f.write(json_str)
+        f.write("\n")
+
+    # Print JSON to stdout
+    print(json_str)
+
+    print(f"Wrote token usage to {output_path}", file=sys.stderr)
+    print(f"  {grand_totals['total_sessions']} sessions, {total_calls_parsed} model calls across {len(log_files)} log files", file=sys.stderr)
+
+    if args.summary:
+        _print_summary(grand_totals, grand_by_model_clean, session_list)
+
+
+def _fmt(n):
+    """Format large numbers with k/m suffixes."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}m"
+    elif n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def _add_formatted(d):
+    """Add human-readable formatted strings to a stats dict."""
+    d["input_tokens_formatted"] = _fmt(d.get("input_tokens", d.get("total_input_tokens", 0)))
+    d["output_tokens_formatted"] = _fmt(d.get("output_tokens", d.get("total_output_tokens", 0)))
+    d["cached_tokens_formatted"] = _fmt(d.get("cached_tokens", d.get("total_cached_tokens", 0)))
+    return d
+
+
+def _print_summary(grand_totals, by_model, sessions):
+    """Print human-readable summary to stderr."""
+    print("\n--- Token Usage Summary ---", file=sys.stderr)
+    for model, stats in by_model.items():
+        inp = _fmt(stats["input_tokens"])
+        out = _fmt(stats["output_tokens"])
+        cached = _fmt(stats["cached_tokens"])
+        est = stats["estimated_premium_requests"]
+        print(f"  {model}: {inp} in, {out} out, {cached} cached (Est. {est} Premium requests)", file=sys.stderr)
+
+    print(f"\n  Total: {_fmt(grand_totals['total_input_tokens'])} in, "
+          f"{_fmt(grand_totals['total_output_tokens'])} out, "
+          f"{_fmt(grand_totals['total_cached_tokens'])} cached", file=sys.stderr)
+    print(f"  Est. Premium requests: {grand_totals['estimated_premium_requests']}", file=sys.stderr)
+
+    # Show last 5 sessions
+    if sessions:
+        print(f"\n  Last 5 sessions:", file=sys.stderr)
+        for sess in sessions[-5:]:
+            sid = sess["session_id"][:8]
+            t = sess["totals"]
+            models = ", ".join(sess["models"].keys())
+            print(f"    {sid}… | {_fmt(t['input_tokens'])} in, {_fmt(t['output_tokens'])} out | {models}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
