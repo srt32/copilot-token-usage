@@ -235,12 +235,18 @@ def main():
     }
 
     # Write JSON
-    output_path = Path(args.output)
+    output_path = Path(args.output).resolve()
     json_str = json.dumps(output, indent=2, default=str)
 
-    with open(output_path, "w") as f:
+    if output_path.is_symlink():
+        print(f"Error: output path is a symlink, refusing to write: {output_path}", file=sys.stderr)
+        sys.exit(1)
+
+    fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(json_str)
         f.write("\n")
+    os.chmod(output_path, 0o600)
 
     if args.details:
         print(json_str)
