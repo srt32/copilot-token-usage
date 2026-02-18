@@ -247,6 +247,10 @@ def main():
 
     print(f"Wrote token usage to {output_path}", file=sys.stderr)
     print(f"  {grand_totals['total_sessions']} sessions, {total_calls_parsed} model calls across {len(log_files)} log files", file=sys.stderr)
+    print(f"  {_fmt(grand_totals['total_input_tokens'])} in, "
+          f"{_fmt(grand_totals['total_output_tokens'])} out, "
+          f"{_fmt(grand_totals['total_cached_tokens'])} cached "
+          f"(Est. {grand_totals['estimated_premium_requests']} Premium requests)", file=sys.stderr)
 
     if args.summary:
         _print_summary(grand_totals, grand_by_model_clean, session_list)
