@@ -97,8 +97,8 @@ def main():
         help=f"Output JSON file path (default: {DEFAULT_OUTPUT})"
     )
     parser.add_argument(
-        "--pretty", action="store_true",
-        help="Pretty-print JSON output"
+        "--details", action="store_true",
+        help="Print full JSON to stdout (default: summary only)"
     )
     parser.add_argument(
         "--session", type=str, default=None,
@@ -106,7 +106,7 @@ def main():
     )
     parser.add_argument(
         "--summary", action="store_true",
-        help="Print a human-readable summary to stderr"
+        help="Print per-model and per-session breakdown"
     )
     args = parser.parse_args()
 
@@ -242,15 +242,15 @@ def main():
         f.write(json_str)
         f.write("\n")
 
-    # Print JSON to stdout
-    print(json_str)
+    if args.details:
+        print(json_str)
 
-    print(f"Wrote token usage to {output_path}", file=sys.stderr)
-    print(f"  {grand_totals['total_sessions']} sessions, {total_calls_parsed} model calls across {len(log_files)} log files", file=sys.stderr)
+    print(f"{grand_totals['total_sessions']} sessions, {total_calls_parsed} model calls across {len(log_files)} log files")
     print(f"  {_fmt(grand_totals['total_input_tokens'])} in, "
           f"{_fmt(grand_totals['total_output_tokens'])} out, "
           f"{_fmt(grand_totals['total_cached_tokens'])} cached "
-          f"(Est. {grand_totals['estimated_premium_requests']} Premium requests)", file=sys.stderr)
+          f"(Est. {grand_totals['estimated_premium_requests']} Premium requests)")
+    print(f"  Wrote JSON to {output_path}")
 
     if args.summary:
         _print_summary(grand_totals, grand_by_model_clean, session_list)
